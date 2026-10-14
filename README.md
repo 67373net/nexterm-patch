@@ -6,14 +6,17 @@
 
 ## 核心解决的问题
 
-1. **彻底解决 SFTP 运行一段时间自动断开 (v1.3.0 新增)**：
+1. **解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (v1.4.0 新增)**：
+   - 官方前端代码在 Vite 打包时保留了 ES2022 的类静态初始化块（`static { ... }`），而 Safari 15.6（iPadOS 15.8.8 最高支持版本）不支持该语法，导致动态加载代码块时抛出 `SyntaxError: Unexpected token '{' (promiseReactionJob)` 并陷入白屏；
+   - 补丁脚本在 Docker 启动时使用 Node.js 自动将前端静态文件中的 `static { ... }` 降级替换为 Safari 14.1+ 原生支持的静态字段自执行函数（`static __init=(()=>{ ... })()`），**用户无需任何前端编译环境**即可使老旧 iPad 丝滑访问 Nexterm。
+2. **彻底解决 SFTP 运行一段时间自动断开 (v1.3.0)**：
    - 官方底层 C 引擎（`engine/src/net/sftp.c`）在空闲时仅轮询内部通道，从不读取底层的 SSH 网络套接字，导致远程服务器发来的心跳包（`ClientAliveInterval`）无法被响应，达到次数后被服务端强制踢出；
    - 补丁在 Node.js 端注入每 25 秒的静默应用层心跳（`realpath(".")`），强制唤醒 C 引擎读写网络流并重置两端空闲计时器，同时增加 WebSocket Ping 心跳穿透 Nginx/Cloudflare。
-2. **突破 6 小时强制断开硬编码**：官方代码在 `SessionManager.js` 中每 30 分钟轮询一次，强杀创建满 6 小时的所有会话。
-3. **修复 SSH 活跃时间未刷新缺陷**：官方在 `hooks/ssh.js` 中遗漏了 `updateActivity` 调用，导致无论用户是否在使用，连接到达 6 小时必然被杀死。
-4. **彻底解决多窗口/跨设备同步崩溃 (Critical Bug)**：修复因原生 `hooks/ssh.js` 缺失 `logger` 引用导致关闭单个标签页触发 `ReferenceError`、进而致使整个容器主进程闪退重启并丢失全部连接的严重缺陷。
-5. **注入全协议精准断连诊断日志**：支持 SSH 与 SFTP 的对端 EOF、网络 Socket 重置追踪，统一带有 `[DISCONNECT-LOG]` 标识。
-6. **官方镜像无缝跟随升级**：采用 Docker Entrypoint Wrapper（启动包装）机制，每次拉取官方最新镜像启动时自动完成热补丁，完全不影响官方代码更新。
+3. **突破 6 小时强制断开硬编码**：官方代码在 `SessionManager.js` 中每 30 分钟轮询一次，强杀创建满 6 小时的所有会话。
+4. **修复 SSH 活跃时间未刷新缺陷**：官方在 `hooks/ssh.js` 中遗漏了 `updateActivity` 调用，导致无论用户是否在使用，连接到达 6 小时必然被杀死。
+5. **彻底解决多窗口/跨设备同步崩溃 (Critical Bug)**：修复因原生 `hooks/ssh.js` 缺失 `logger` 引用导致关闭单个标签页触发 `ReferenceError`、进而致使整个容器主进程闪退重启并丢失全部连接的严重缺陷。
+6. **注入全协议精准断连诊断日志**：支持 SSH 与 SFTP 的对端 EOF、网络 Socket 重置追踪，统一带有 `[DISCONNECT-LOG]` 标识。
+7. **官方镜像无缝跟随升级**：采用 Docker Entrypoint Wrapper（启动包装）机制，每次拉取官方最新镜像启动时自动完成热补丁，完全不影响官方代码更新。
 
 ---
 
@@ -96,13 +99,21 @@ docker exec -it nexterm grep -n "sftpKeepAlive" /app/server/lib/ConnectionServic
 
 # 检查 SFTP WebSocket 活跃度刷新与 Ping
 docker exec -it nexterm grep -n "sftpWsPing" /app/server/routes/sftpWS.js
+
+# 检查前端静态资源 Safari 15 兼容性补丁是否生效
+docker exec -it nexterm grep -n "__init" /app/dist/assets/*.js
 ```
 
 ---
 
 ## 版本演进记录 (Changelog)
 
-- **v1.3.0 (Latest)**：
+- **v1.4.0 (Latest)**：
+  - **新增老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 前端语法降级兼容补丁**：
+    - 针对 iPadOS 15.8.8 (Safari 15.6) 报错 `SyntaxError: Unexpected token '{' (promiseReactionJob)` 白屏问题；
+    - 启动时自动扫描 `/app/dist` 静态资源，将 ES2022 `static { ... }` 动态转译为 Safari 14.1+ 即原生支持的静态字段自执行函数（`static __init=(()=>{ ... })()`）；
+    - 无需重新配置 Vite 或在本地编译前端代码，容器启动时全自动就地生效。
+- **v1.3.0**：
   - **新增 SFTP 全链路防断开体系**：
     - 针对底层 C 引擎不轮询底层套接字的缺陷，在 `ConnectionService.js` 中为 SFTP 注入每 25 秒的主动应用层保活（`realpath(".")`），穿透 NAT 并促使 libssh2 应答服务端心跳；
     - 在 `routes/sftpWS.js` 中注入 WebSocket Ping 心跳与全量文件操作活跃度自动刷新；

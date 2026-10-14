@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================================
-# Nexterm 增强版防断连与多窗口防崩溃补丁脚本 (v1.3.0 - 含 SFTP 保活与防断开)
+# Nexterm 增强版防断连、防崩溃与兼容性热补丁脚本 (v1.4.0 - 含 SFTP 保活与 Safari 15 兼容)
 #
 # 【核心功能说明】
 # 1. 修复 SSH 活跃时间刷新与多窗口防崩溃 (hooks/ssh.js)：
@@ -15,12 +15,16 @@ set -e
 # 3. 增强 SSH 底层断连诊断日志 (ConnectionService.js)：
 #    - 捕获 SSH 正常挂断 (EOF) 与网络异常 (Socket Error)。
 #
-# 4. 彻底解决 SFTP 闲置断开与超时 (ConnectionService.js & routes/sftpWS.js) [v1.3.0 新增]：
+# 4. 彻底解决 SFTP 闲置断开与超时 (ConnectionService.js & routes/sftpWS.js) [v1.3.0]：
 #    - 注入 SFTP 底层主动保活心跳：每 25 秒自动发送一次轻量 realpath(".") 请求，
 #      唤醒 C 引擎并向远程 SSH 服务器发送应用层包，穿透 NAT 防火墙，并使 libssh2 能够及时响应服务端的 ClientAlive 心跳。
 #    - 注入 SFTP WebSocket 层保活 Ping：防止浏览器后台挂起或反向代理（Nginx/CF）超时断开。
 #    - 用户在 SFTP 文件管理器中执行任何操作时均自动刷新活跃时间。
 #    - 注入 SFTP 断开诊断日志 ([DISCONNECT-LOG])。
+#
+# 5. 解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (dist/*.js) [v1.4.0 新增]：
+#    - 启动时自动扫描并降级前端静态资源中的 ES2022 Class Static Initialization Blocks (`static { ... }`)。
+#    - 解决 Safari 15.6 / WebKit 605 抛出 `SyntaxError: Unexpected token '{'` 导致白屏打不开的问题。
 #
 # 【运维排查常用指令】
 # 1. 动态过滤断连诊断日志：
@@ -75,6 +79,165 @@ if [ -f /app/server/routes/sftpWS.js ]; then
     sed -i '/const messageHandler = async (msg) => {/a \            try { SessionManager.updateActivity(sessionId); } catch(e){}' /app/server/routes/sftpWS.js
     sed -i '/ws\.on("close", async () => {/a \            clearInterval(sftpWsPing); try { logger.system(`[DISCONNECT-LOG] 前端SFTP标签页关闭: ${entry?.name || sessionId}`); } catch(e){}' /app/server/routes/sftpWS.js
     echo "[Nexterm-Patch] 4. routes/sftpWS.js 补丁注入成功 (SFTP 前端心跳与活跃刷新)"
+fi
+
+# 5. 修复前端静态资源对老旧 iPad (Safari 15 / iPadOS 15.8.8) 的兼容性 (v1.4.0 新增)
+#    - 自动降级前端静态资源中的 ES2022 Class Static Initialization Blocks (static { ... })
+#    - 解决 Safari 15.6 / WebKit 605 抛出 SyntaxError: Unexpected token '{' 导致白屏打不开的问题
+if [ -d /app/dist ]; then
+    node << 'NODE_EOF'
+const fs = require('fs');
+const path = require('path');
+
+function findJsFiles(dir) {
+    let results = [];
+    if (!fs.existsSync(dir)) return results;
+    for (const file of fs.readdirSync(dir)) {
+        const fullPath = path.join(dir, file);
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+            results = results.concat(findJsFiles(fullPath));
+        } else if (file.endsWith('.js')) {
+            results.push(fullPath);
+        }
+    }
+    return results;
+}
+
+function transform(content) {
+    let result = '';
+    let i = 0;
+    const n = content.length;
+    let modified = 0;
+    let initIdx = 0;
+
+    while (i < n) {
+        if (content[i] === '"' || content[i] === "'") {
+            const quote = content[i];
+            let start = i;
+            i++;
+            while (i < n) {
+                if (content[i] === '\\') { i += 2; }
+                else if (content[i] === quote) { i++; break; }
+                else { i++; }
+            }
+            result += content.slice(start, i);
+        } else if (content[i] === '`') {
+            let start = i;
+            i++;
+            while (i < n) {
+                if (content[i] === '\\') { i += 2; }
+                else if (content[i] === '`') { i++; break; }
+                else { i++; }
+            }
+            result += content.slice(start, i);
+        } else if (content[i] === '/' && content[i + 1] === '/') {
+            let start = i;
+            i += 2;
+            while (i < n && content[i] !== '\n') i++;
+            result += content.slice(start, i);
+        } else if (content[i] === '/' && content[i + 1] === '*') {
+            let start = i;
+            i += 2;
+            while (i < n && !(content[i] === '*' && content[i + 1] === '/')) i++;
+            i += 2;
+            result += content.slice(start, i);
+        } else if (content.startsWith('static', i) && (i === 0 || !/[a-zA-Z0-9_$]/.test(content[i - 1]))) {
+            let p = i + 6;
+            while (p < n && (content[p] === ' ' || content[p] === '\t' || content[p] === '\n' || content[p] === '\r')) p++;
+            if (content[p] === '{') {
+                p++;
+                let braceCount = 1;
+                const bodyStart = p;
+                while (p < n && braceCount > 0) {
+                    const ch = content[p];
+                    if (ch === '{') { braceCount++; p++; }
+                    else if (ch === '}') {
+                        braceCount--;
+                        if (braceCount === 0) { p++; break; }
+                        p++;
+                    } else if (ch === '"' || ch === "'" || ch === '`') {
+                        const q = ch;
+                        p++;
+                        while (p < n) {
+                            if (content[p] === '\\') p += 2;
+                            else if (content[p] === q) { p++; break; }
+                            else p++;
+                        }
+                    } else if (ch === '/' && content[p + 1] === '/') {
+                        p += 2;
+                        while (p < n && content[p] !== '\n') p++;
+                    } else if (ch === '/' && content[p + 1] === '*') {
+                        p += 2;
+                        while (p < n && !(content[p] === '*' && content[p + 1] === '/')) p++;
+                        p += 2;
+                    } else if (ch === '/') {
+                        let prev = p - 1;
+                        while (prev >= bodyStart && (content[prev] === ' ' || content[prev] === '\t')) prev--;
+                        const prevCh = content[prev];
+                        if ('=([,;:!?&|{'.includes(prevCh)) {
+                            p++;
+                            while (p < n) {
+                                if (content[p] === '\\') p += 2;
+                                else if (content[p] === '[') {
+                                    p++;
+                                    while (p < n && content[p] !== ']') {
+                                        if (content[p] === '\\') p += 2;
+                                        else p++;
+                                    }
+                                    p++;
+                                } else if (content[p] === '/') {
+                                    p++;
+                                    break;
+                                } else p++;
+                            }
+                        } else {
+                            p++;
+                        }
+                    } else {
+                        p++;
+                    }
+                }
+                if (braceCount === 0) {
+                    initIdx++;
+                    result += 'static __init_' + initIdx + '=(()=>{' + content.slice(bodyStart, p - 1) + '})();';
+                    i = p;
+                    modified++;
+                    continue;
+                }
+            }
+            result += content[i];
+            i++;
+        } else {
+            result += content[i];
+            i++;
+        }
+    }
+    return { result, modified };
+}
+
+try {
+    const jsFiles = findJsFiles('/app/dist');
+    let totalPatched = 0;
+    for (const file of jsFiles) {
+        const content = fs.readFileSync(file, 'utf8');
+        if (content.includes('static') && /static\s*\{/.test(content)) {
+            const { result, modified } = transform(content);
+            if (modified > 0) {
+                fs.writeFileSync(file, result, 'utf8');
+                totalPatched += modified;
+            }
+        }
+    }
+    if (totalPatched > 0) {
+        console.log(`[Nexterm-Patch] 5. 前端资源补丁成功: 已自动将 ${totalPatched} 处 static { 语法块降级为 Safari 15 / iPad Air 2 兼容语法!`);
+    } else {
+        console.log('[Nexterm-Patch] 5. 前端静态资源扫描完毕 (已是兼容格式或无需降级)');
+    }
+} catch (err) {
+    console.error('[Nexterm-Patch] 5. 前端资源补丁处理跳过 (非关键错误):', err.message);
+}
+NODE_EOF
 fi
 
 echo "[Nexterm-Patch] 所有补丁加载完毕，正在启动 Nexterm..."

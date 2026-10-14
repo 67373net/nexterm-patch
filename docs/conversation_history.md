@@ -167,3 +167,61 @@
    - 每 25 秒向浏览器发送原生 `ws.ping()`，穿透 Nginx 和浏览器后台挂起。
 3. **注入 SFTP 底层断连诊断日志**：
    - 当 SFTP 连接因任何外部原因挂断或网络异常时，在日志中明确打出 `[DISCONNECT-LOG] SFTP对端连接断开` 或 `[DISCONNECT-LOG] SFTP网络异常`。
+
+---
+
+## 八、 老旧 iPad (iPad Air 2 / iPadOS 15.8.8) 白屏报错排查与全自动前端热补丁 (v1.4.0)
+
+### 8.1 用户反馈与报错现象
+- **设备环境**：iPad Air 2，系统版本停留在官方最终支持的 **iPadOS 15.8.8**（内置 Safari 15.6 / WebKit 605）。
+- **现象描述**：
+  - 新型号的 iPhone（iOS 16+ / 17+ / 18+）访问 Nexterm 一切正常；
+  - 但在 iPad Air 2 的 Safari 浏览器中打开 Nexterm 时直接白屏；
+  - 开发者工具控制台报错：
+    ```text
+    [Error] SyntaxError: Unexpected token '{'
+        promiseReactionJob
+    ```
+- **用户诉求**：无需复杂的手动重新编译、修改 tsconfig 或搭建前端构建环境，希望像之前的防断连补丁一样，直接通过 `patch-and-start.sh` 脚本在 Docker 启动时一键全自动注入兼容性补丁。
+
+### 8.2 根因定位分析
+1. **ES2022 Class Static Initialization Blocks (`static { ... }`) 语法门槛**：
+   - 现代前端构建工具（如 Nexterm 使用的 Vite / esbuild / Rollup）如果未针对旧版 Safari 指定目标环境（`target: ['es2020', 'safari14']`），默认会将 ES2022+ 的语法直接打包到产物中；
+   - ECMAScript 2022 引入的类静态初始化块（`static { ... }`）直到 **Safari 16.4**（2023 年 3 月发布）才首次获得 WebKit 原生支持；
+   - iPad Air 2 受限于 Apple A8X 芯片硬件，最高只能升级至 iPadOS 15.8.8（Safari 15.6）。
+2. **`promiseReactionJob` 异步 Chunk 报错机理**：
+   - React 19 应用通过动态导入（`import(...)`）异步加载前端路由组件，浏览器在底层微任务队列（`promiseReactionJob`）中解析下载的 JavaScript 代码；
+   - 当 WebKit 605 解析器遇到 `static {` 中的 `{` 时，由于无法识别该语法，直接抛出 `SyntaxError: Unexpected token '{'`；
+   - 动态模块加载失败，导致 React 根组件无法挂载，呈现完全白屏。
+
+### 8.3 纯热补丁方案设计与语法等价代换
+1. **为什么不需要重新编译前端**：
+   - 官方 Docker 镜像中，前端打包后的静态资源位于 `/app/dist/`；
+   - 在 Docker 容器层中，虽然镜像层只读，但容器启动时的读写层（OverlayFS）是完全可读写的；
+   - 容器内自带完整 Node.js 环境（Node v22+），可以在启动后端服务前对 `/app/dist` 目录进行毫秒级 AST / 正则转译。
+2. **ES 语义等价替换**：
+   - Safari 从 **Safari 14.1**（iOS 14.5+）起就完整支持了类的公有静态字段（Public Class Static Fields）及其初始化表达式；
+   - 在 JavaScript 规范中，类静态字段的初始化表达式中的箭头函数，其 `this` 在词法上绑定于当前类构造函数，与 `static { ... }` 内部的 `this` 语义完全一致；
+   - 因此，将：
+     ```javascript
+     class Foo {
+       static {
+         this.bar = 1;
+       }
+     }
+     ```
+     等价代换为：
+     ```javascript
+     class Foo {
+       static __init=(()=>{
+         this.bar = 1;
+       })();
+     }
+     ```
+   - 能够在不改变任何业务逻辑、不污染原型链的前提下，完美使旧版 Safari 15.6 / iPadOS 15.8.8 原生解析执行。
+
+### 8.4 实施与落地 (v1.4.0)
+- 在 `patch-and-start.sh` 中增加模块 5：利用内置 Node.js 递归扫描 `/app/dist` 下的所有 `.js` 静态资源；
+- 采用健壮的状态机扫描，跳过字符串、模板字符串、注释与正则字面量，精准匹配并降级 `static { ... }`；
+- 具备严格的幂等性（Idempotence），多次重启不会重复修改；
+- 用户仅需更新宿主机上的 `patch-and-start.sh` 并执行 `docker compose restart`，即可让老旧 iPad Air 2 彻底告别白屏，完美使用 Nexterm。
