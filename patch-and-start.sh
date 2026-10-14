@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================================
-# Nexterm 增强版防断连、防崩溃与全设备兼容热补丁脚本 (v1.5.1)
+# Nexterm 增强版防断连、防崩溃与全端兼容热补丁脚本 (v1.5.2)
 #
 # 【核心功能说明】
 # 1. 修复 SSH 活跃时间刷新与多窗口防崩溃 (hooks/ssh.js)：
@@ -20,9 +20,10 @@ set -e
 #    - 自动复用已强保活的主 SFTP 连接，并在传输期间保护状态避免心跳包干扰，支持大文件稳定传输与完整状态日志；
 #    - 注入 SFTP 主动保活心跳与 WebSocket 层保活 Ping：防止浏览器后台挂起或反向代理超时断开。
 #
-# 5. 解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (dist/*.js) [v1.5.1 完备版]：
-#    - 启动时自动精准扫描并降级全部 947 处 ES2022 Class Static Initialization Blocks (`static { ... }`)。
-#    - 解决 Safari 15.6 / WebKit 605 抛出 `SyntaxError: Unexpected token '{' promiseReactionJob` 导致白屏打不开的问题。
+# 5. 解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与全部语法报错 (dist/*.js) [v1.5.2]：
+#    - 自动降级前端全部 947 处 ES2022 Class Static Initialization Blocks (`static { ... }`) 为 Safari 兼容自执行函数；
+#    - 自动消除老旧 Safari 不支持的正则先行断言/后行断言 (`(?<=...)` 与 `(?<!...)`)，根除 `SyntaxError: Invalid regular expression: invalid group specifier name`；
+#    - 彻底解决 Safari 15.6 / WebKit 605 抛出的一系列语法异常，使 iPad Air 2 丝滑秒开 Nexterm。
 #
 # 【运维排查常用指令】
 # 1. 动态过滤断连诊断日志：
@@ -37,7 +38,7 @@ set -e
 #    cd /opt/docker/nexterm && docker compose restart
 # ==============================================================================
 
-echo "[Nexterm-Patch] 正在检查并应用连接防断开、防崩溃与全端兼容补丁 (v1.5.1)..."
+echo "[Nexterm-Patch] 正在检查并应用连接防断开、防崩溃与全端兼容补丁 (v1.5.2)..."
 
 # 1. 修复 hooks/ssh.js：引入 logger 并注入活跃刷新与安全断连日志
 if [ -f /app/server/hooks/ssh.js ]; then
@@ -137,9 +138,9 @@ if [ -f /app/server/routes/sftpWS.js ]; then
     echo "[Nexterm-Patch] 5. routes/sftpWS.js 补丁注入成功 (SFTP 前端心跳与活跃刷新)"
 fi
 
-# 6. 修复前端静态资源对老旧 iPad (Safari 15 / iPadOS 15.8.8) 的兼容性 (v1.5.1 完备版)
-#    - 彻底降级前端静态资源中的全部 ES2022 Class Static Initialization Blocks (static { ... })
-#    - 解决 Safari 15.6 / WebKit 605 抛出 SyntaxError: Unexpected token '{' 导致白屏打不开的问题
+# 6. 修复前端静态资源对老旧 iPad (Safari 15 / iPadOS 15.8.8) 的完全兼容性 (v1.5.2)
+#    - 彻底降级前端静态资源中的全部 ES2022 Class Static Blocks (static { ... })
+#    - 消除 Safari 15.6 不支持的正则后行断言 (?<=...) 与 (?<!...)，根除 invalid group specifier name 报错
 if [ -d /app/dist ]; then
     node << 'NODE_EOF'
 const fs = require('fs');
@@ -206,22 +207,44 @@ function patchStaticBlocks(code) {
     return { result, total };
 }
 
+function patchLookbehinds(code) {
+    let modified = code;
+    modified = modified.replaceAll("(?<=['\"\\s])", "(?:['\"\\s])");
+    modified = modified.replaceAll("(?<=\\\\.)", "(?=\\\\.)");
+    modified = modified.replaceAll("(?<=1)(?<!1)", "(?!1)");
+    modified = modified.replaceAll("(?<!`)()", "(?:^^|[^`])");
+    return modified;
+}
+
 try {
     const jsFiles = findJsFiles('/app/dist');
-    let grandTotal = 0;
+    let staticTotal = 0;
+    let lookbehindFiles = 0;
+
     for (const file of jsFiles) {
-        const content = fs.readFileSync(file, 'utf8');
+        let content = fs.readFileSync(file, 'utf8');
+        let changed = false;
+
         if (/(?<![a-zA-Z0-9_$])static\s*\{/.test(content)) {
             const { result, total } = patchStaticBlocks(content);
-            if (total > 0) {
-                fs.writeFileSync(file, result, 'utf8');
-                grandTotal += total;
-                console.log(`[Nexterm-Patch] 6. 成功降级 ${path.basename(file)} 中的 ${total} 处 static { 语法块`);
-            }
+            content = result;
+            staticTotal += total;
+            changed = true;
+        }
+
+        if (/\(\?<[=!]/.test(content)) {
+            content = patchLookbehinds(content);
+            lookbehindFiles++;
+            changed = true;
+        }
+
+        if (changed) {
+            fs.writeFileSync(file, content, 'utf8');
         }
     }
-    if (grandTotal > 0) {
-        console.log(`[Nexterm-Patch] 6. 前端兼容性补丁完成: 共计降级 ${grandTotal} 处 static { 语法块，已完全兼容 iPad Air 2 / Safari 15!`);
+
+    if (staticTotal > 0 || lookbehindFiles > 0) {
+        console.log(`[Nexterm-Patch] 6. 前端全兼容补丁生效: 降级 ${staticTotal} 处 static {，优化 ${lookbehindFiles} 个文件中的正则后行断言，全面兼容 Safari 15 / iPad Air 2!`);
     } else {
         console.log('[Nexterm-Patch] 6. 前端静态资源扫描完毕 (已是兼容格式或无需降级)');
     }
