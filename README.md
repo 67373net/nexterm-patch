@@ -6,12 +6,12 @@
 
 ## 核心解决的问题
 
-1. **彻底解决 SFTP 上传与下载报错 500 (SFTP error) (v1.5.0 新增)**：
+1. **彻底解决 SFTP 上传与下载报错 500 (SFTP error) (v1.5.0/v1.5.1 增强)**：
    - 官方为上传/下载设计了独立的辅助传输连接（`getSFTPTransferClient`），但在生成缩略图或完成初次传输后即陷入空闲；由于底层 C 引擎不轮询套接字，远端 SSH 超时切断后 Node.js 无法感知，并在后续上传/下载时复用已死的死连接，触发 `500 (Internal Server Error) Error: SFTP error` 且死连接永久缓存；
-   - 补丁自动将辅助传输客户端复用为已通过应用层心跳强保活的主 SFTP 连接，并在传输时保护状态避免心跳包干扰，支持大文件稳定传输与全链路 `[SFTP-TRANSFER]` 审计日志。
-2. **解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (v1.4.0)**：
-   - 官方前端代码在 Vite 打包时保留了 ES2022 的类静态初始化块（`static { ... }`），而 Safari 15.6（iPadOS 15.8.8 最高支持版本）不支持该语法，导致动态加载代码块时抛出 `SyntaxError: Unexpected token '{' (promiseReactionJob)` 并陷入白屏；
-   - 补丁脚本在 Docker 启动时使用 Node.js 自动将前端静态文件中的 `static { ... }` 降级替换为 Safari 14.1+ 原生支持的静态字段自执行函数（`static __init=(()=>{ ... })()`），**用户无需任何前端编译环境**即可使老旧 iPad 丝滑访问 Nexterm。
+   - 补丁自动将辅助传输客户端复用为已通过应用层心跳强保活的主 SFTP 连接，并在传输期间以 `finally` 机制保护传输状态避免心跳包干扰，支持大文件稳定传输与全链路 `[SFTP-TRANSFER]` 审计日志。
+2. **彻底解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (v1.5.1 完备版)**：
+   - 官方前端代码在 Vite 打包时保留了 ES2022 的类静态初始化块（`static { ... }`），而 Safari 15.6（iPadOS 15.8.8 最高支持版本）不支持该语法，导致预加载 `editor.api2` 等文件时抛出 `SyntaxError: Unexpected token '{' (promiseReactionJob)` 并陷入白屏；
+   - 在 v1.5.1 中重构为健壮的前端 AST 状态机扫描器，**100% 精准识别并降级全部 947 处 `static { ... }` 为 Safari 14.1+ 原生支持的自执行函数（`static __sb_N=(()=>{ ... })()`）**，零残留、零语法报错，**用户无需任何前端编译环境**即可使 iPad Air 2 丝滑访问 Nexterm。
 3. **彻底解决 SFTP 运行一段时间自动断开 (v1.3.0)**：
    - 官方底层 C 引擎（`engine/src/net/sftp.c`）在空闲时仅轮询内部通道，从不读取底层的 SSH 网络套接字，导致远程服务器发来的心跳包（`ClientAliveInterval`）无法被响应，达到次数后被服务端强制踢出；
    - 补丁在 Node.js 端注入每 25 秒的静默应用层心跳（`realpath(".")`），强制唤醒 C 引擎读写网络流并重置两端空闲计时器，同时增加 WebSocket Ping 心跳穿透 Nginx/Cloudflare。

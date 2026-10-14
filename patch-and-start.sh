@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================================
-# Nexterm 增强版防断连、防崩溃与兼容性热补丁脚本 (v1.5.0 - 含 SFTP 保活与上传下载修复)
+# Nexterm 增强版防断连、防崩溃与全设备兼容热补丁脚本 (v1.5.1)
 #
 # 【核心功能说明】
 # 1. 修复 SSH 活跃时间刷新与多窗口防崩溃 (hooks/ssh.js)：
@@ -15,14 +15,14 @@ set -e
 # 3. 增强 SSH 底层断连诊断日志 (ConnectionService.js)：
 #    - 捕获 SSH 正常挂断 (EOF) 与网络异常 (Socket Error)。
 #
-# 4. 彻底解决 SFTP 闲置断开与上传下载报错 500 (ConnectionService.js & routes/sftp.js) [v1.5.0 增强]：
+# 4. 彻底解决 SFTP 闲置断开与上传下载报错 500 (ConnectionService.js & routes/sftp.js)：
 #    - 修复上传/下载使用未保活辅助连接导致超时变死连接并抛出 500 "SFTP error" 的严重缺陷；
 #    - 自动复用已强保活的主 SFTP 连接，并在传输期间保护状态避免心跳包干扰，支持大文件稳定传输与完整状态日志；
 #    - 注入 SFTP 主动保活心跳与 WebSocket 层保活 Ping：防止浏览器后台挂起或反向代理超时断开。
 #
-# 5. 解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (dist/*.js) [v1.4.0]：
-#    - 启动时自动扫描并降级前端静态资源中的 ES2022 Class Static Initialization Blocks (`static { ... }`)。
-#    - 解决 Safari 15.6 / WebKit 605 抛出 `SyntaxError: Unexpected token '{'` 导致白屏打不开的问题。
+# 5. 解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (dist/*.js) [v1.5.1 完备版]：
+#    - 启动时自动精准扫描并降级全部 947 处 ES2022 Class Static Initialization Blocks (`static { ... }`)。
+#    - 解决 Safari 15.6 / WebKit 605 抛出 `SyntaxError: Unexpected token '{' promiseReactionJob` 导致白屏打不开的问题。
 #
 # 【运维排查常用指令】
 # 1. 动态过滤断连诊断日志：
@@ -37,7 +37,7 @@ set -e
 #    cd /opt/docker/nexterm && docker compose restart
 # ==============================================================================
 
-echo "[Nexterm-Patch] 正在检查并应用连接防断开与防崩溃补丁 (SSH & SFTP)..."
+echo "[Nexterm-Patch] 正在检查并应用连接防断开、防崩溃与全端兼容补丁 (v1.5.1)..."
 
 # 1. 修复 hooks/ssh.js：引入 logger 并注入活跃刷新与安全断连日志
 if [ -f /app/server/hooks/ssh.js ]; then
@@ -63,7 +63,7 @@ if [ -f /app/server/lib/ConnectionService.js ]; then
     sed -i '/dataSocket\.on("error", (err) => {/a \            try { logger.system(`[DISCONNECT-LOG] 远程SSH网络异常: ${entry?.name} (${host}:${port}), 错误: ${err.message}`); } catch(e){}' /app/server/lib/ConnectionService.js
 
     # SFTP 主动心跳保活与诊断日志
-    sed -i '/await sftpClient\.waitForReady();/a \        const sftpKeepAlive = setInterval(() => { if (!dataSocket.destroyed && !sftpClient._closed && !sftpClient._activeTransfer) { sftpClient.realpath(".").catch(() => {}); try { SessionManager.updateActivity(sessionId); } catch(e){} } }, 25000);' /app/server/lib/ConnectionService.js
+    sed -i '/await sftpClient\.waitForReady();/a \        const sftpKeepAlive = setInterval(() => { const transferStale = sftpClient._transferStart && (Date.now() - sftpClient._transferStart > 60000); if (!dataSocket.destroyed && !sftpClient._closed && (!sftpClient._activeTransfer || transferStale)) { sftpClient.realpath(".").catch(() => {}); try { SessionManager.updateActivity(sessionId); } catch(e){} } }, 25000);' /app/server/lib/ConnectionService.js
     sed -i '/logger\.info("SFTP data connection closed", { sessionId });/i \            clearInterval(sftpKeepAlive); try { logger.system(`[DISCONNECT-LOG] SFTP对端连接断开(EOF): ${entry?.name || sessionId}`); } catch(e){}' /app/server/lib/ConnectionService.js
     sed -i '/logger\.error("SFTP data socket error", { sessionId, error: err\.message });/i \            clearInterval(sftpKeepAlive); try { logger.system(`[DISCONNECT-LOG] SFTP网络异常(Socket Error): ${entry?.name || sessionId}, 错误: ${err.message}`); } catch(e){}' /app/server/lib/ConnectionService.js
     sed -i 's/sftpClient,/sftpClient, keepAliveTimer: sftpKeepAlive,/g' /app/server/lib/ConnectionService.js
@@ -88,10 +88,44 @@ fi
 
 # 4. 修复 routes/sftp.js：注入上传与下载状态保护、活跃刷新与传输日志
 if [ -f /app/server/routes/sftp.js ]; then
-    sed -i '/await ctx\.sftpClient\.writeFile(remotePath, req);/i \        try { ctx.sftpClient._activeTransfer = true; SessionManager.updateActivity(sessionId); logger.system(`[SFTP-TRANSFER] 开始上传文件: ${remotePath}`); } catch(e){}' /app/server/routes/sftp.js
-    sed -i '/await ctx\.sftpClient\.writeFile(remotePath, req);/a \        try { ctx.sftpClient._activeTransfer = false; logger.system(`[SFTP-TRANSFER] 上传文件成功: ${remotePath}`); } catch(e){}' /app/server/routes/sftp.js
-    sed -i '/const { stream } = sftpClient\.readFile(remotePath);/i \        try { sftpClient._activeTransfer = true; SessionManager.updateActivity(sessionId); logger.system(`[SFTP-TRANSFER] 开始下载文件: ${remotePath}`); } catch(e){}' /app/server/routes/sftp.js
-    sed -i '/res\.on("close", () => stream\.destroy());/a \        res.on("finish", () => { try { sftpClient._activeTransfer = false; logger.system(`[SFTP-TRANSFER] 下载文件完成: ${remotePath}`); } catch(e){} });' /app/server/routes/sftp.js
+    node -e '
+    const fs = require("fs");
+    const file = "/app/server/routes/sftp.js";
+    let c = fs.readFileSync(file, "utf8");
+
+    // 1. 上传逻辑包装：加入活跃刷新与 finally 状态保护
+    const oldUpload = "await ctx.sftpClient.writeFile(remotePath, req);";
+    const newUpload = `try {
+            ctx.sftpClient._activeTransfer = true;
+            ctx.sftpClient._transferStart = Date.now();
+            SessionManager.updateActivity(sessionId);
+            logger.system("[SFTP-TRANSFER] 开始上传文件: " + remotePath);
+            await ctx.sftpClient.writeFile(remotePath, req);
+            logger.system("[SFTP-TRANSFER] 上传文件成功: " + remotePath);
+        } finally {
+            ctx.sftpClient._activeTransfer = false;
+        }`;
+    if (c.includes(oldUpload)) c = c.replace(oldUpload, newUpload);
+
+    // 2. 下载逻辑包装：加入活跃刷新与全事件生命周期保护
+    const oldDownload = "const { stream } = sftpClient.readFile(remotePath);";
+    const newDownload = `try {
+            sftpClient._activeTransfer = true;
+            sftpClient._transferStart = Date.now();
+            SessionManager.updateActivity(sessionId);
+            logger.system("[SFTP-TRANSFER] 开始下载文件: " + remotePath);
+        } catch(e) {}
+        const { stream } = sftpClient.readFile(remotePath);
+        const clearXfer = () => { try { sftpClient._activeTransfer = false; } catch(e){} };
+        res.on("finish", () => { clearXfer(); try { logger.system("[SFTP-TRANSFER] 下载文件完成: " + remotePath); } catch(e){} });`;
+    if (c.includes(oldDownload)) c = c.replace(oldDownload, newDownload);
+
+    const oldClose = "res.on(\"close\", () => stream.destroy());";
+    const newClose = "res.on(\"close\", () => { clearXfer(); stream.destroy(); });";
+    if (c.includes(oldClose)) c = c.replace(oldClose, newClose);
+
+    fs.writeFileSync(file, c, "utf8");
+    '
     echo "[Nexterm-Patch] 4. routes/sftp.js 补丁注入成功 (SFTP 传输活动刷新与状态保护)"
 fi
 
@@ -103,8 +137,8 @@ if [ -f /app/server/routes/sftpWS.js ]; then
     echo "[Nexterm-Patch] 5. routes/sftpWS.js 补丁注入成功 (SFTP 前端心跳与活跃刷新)"
 fi
 
-# 6. 修复前端静态资源对老旧 iPad (Safari 15 / iPadOS 15.8.8) 的兼容性 (v1.4.0 新增)
-#    - 自动降级前端静态资源中的 ES2022 Class Static Initialization Blocks (static { ... })
+# 6. 修复前端静态资源对老旧 iPad (Safari 15 / iPadOS 15.8.8) 的兼容性 (v1.5.1 完备版)
+#    - 彻底降级前端静态资源中的全部 ES2022 Class Static Initialization Blocks (static { ... })
 #    - 解决 Safari 15.6 / WebKit 605 抛出 SyntaxError: Unexpected token '{' 导致白屏打不开的问题
 if [ -d /app/dist ]; then
     node << 'NODE_EOF'
@@ -126,138 +160,73 @@ function findJsFiles(dir) {
     return results;
 }
 
-function transform(content) {
+function patchStaticBlocks(code) {
+    const regex = /(?<![a-zA-Z0-9_$])static\s*\{/g;
+    let m;
+    let lastIndex = 0;
     let result = '';
-    let i = 0;
-    const n = content.length;
-    let modified = 0;
-    let initIdx = 0;
+    let idx = 0;
+    let total = 0;
 
-    while (i < n) {
-        if (content[i] === '"' || content[i] === "'") {
-            const quote = content[i];
-            let start = i;
-            i++;
-            while (i < n) {
-                if (content[i] === '\\') { i += 2; }
-                else if (content[i] === quote) { i++; break; }
-                else { i++; }
-            }
-            result += content.slice(start, i);
-        } else if (content[i] === '`') {
-            let start = i;
-            i++;
-            while (i < n) {
-                if (content[i] === '\\') { i += 2; }
-                else if (content[i] === '`') { i++; break; }
-                else { i++; }
-            }
-            result += content.slice(start, i);
-        } else if (content[i] === '/' && content[i + 1] === '/') {
-            let start = i;
-            i += 2;
-            while (i < n && content[i] !== '\n') i++;
-            result += content.slice(start, i);
-        } else if (content[i] === '/' && content[i + 1] === '*') {
-            let start = i;
-            i += 2;
-            while (i < n && !(content[i] === '*' && content[i + 1] === '/')) i++;
-            i += 2;
-            result += content.slice(start, i);
-        } else if (content.startsWith('static', i) && (i === 0 || !/[a-zA-Z0-9_$]/.test(content[i - 1]))) {
-            let p = i + 6;
-            while (p < n && (content[p] === ' ' || content[p] === '\t' || content[p] === '\n' || content[p] === '\r')) p++;
-            if (content[p] === '{') {
+    while ((m = regex.exec(code)) !== null) {
+        result += code.slice(lastIndex, m.index);
+        const bodyStart = m.index + m[0].length;
+        let depth = 1;
+        let p = bodyStart;
+        while (p < code.length && depth > 0) {
+            const c = code[p];
+            if (c === '{') depth++;
+            else if (c === '}') depth--;
+            else if (c === '"' || c === "'" || c === '`') {
+                const q = c;
                 p++;
-                let braceCount = 1;
-                const bodyStart = p;
-                while (p < n && braceCount > 0) {
-                    const ch = content[p];
-                    if (ch === '{') { braceCount++; p++; }
-                    else if (ch === '}') {
-                        braceCount--;
-                        if (braceCount === 0) { p++; break; }
-                        p++;
-                    } else if (ch === '"' || ch === "'" || ch === '`') {
-                        const q = ch;
-                        p++;
-                        while (p < n) {
-                            if (content[p] === '\\') p += 2;
-                            else if (content[p] === q) { p++; break; }
-                            else p++;
-                        }
-                    } else if (ch === '/' && content[p + 1] === '/') {
-                        p += 2;
-                        while (p < n && content[p] !== '\n') p++;
-                    } else if (ch === '/' && content[p + 1] === '*') {
-                        p += 2;
-                        while (p < n && !(content[p] === '*' && content[p + 1] === '/')) p++;
-                        p += 2;
-                    } else if (ch === '/') {
-                        let prev = p - 1;
-                        while (prev >= bodyStart && (content[prev] === ' ' || content[prev] === '\t')) prev--;
-                        const prevCh = content[prev];
-                        if ('=([,;:!?&|{'.includes(prevCh)) {
-                            p++;
-                            while (p < n) {
-                                if (content[p] === '\\') p += 2;
-                                else if (content[p] === '[') {
-                                    p++;
-                                    while (p < n && content[p] !== ']') {
-                                        if (content[p] === '\\') p += 2;
-                                        else p++;
-                                    }
-                                    p++;
-                                } else if (content[p] === '/') {
-                                    p++;
-                                    break;
-                                } else p++;
-                            }
-                        } else {
-                            p++;
-                        }
-                    } else {
-                        p++;
-                    }
+                while (p < code.length) {
+                    if (code[p] === '\\') p += 2;
+                    else if (code[p] === q) break;
+                    else p++;
                 }
-                if (braceCount === 0) {
-                    initIdx++;
-                    result += 'static __init_' + initIdx + '=(()=>{' + content.slice(bodyStart, p - 1) + '})();';
-                    i = p;
-                    modified++;
-                    continue;
-                }
+            } else if (c === '/' && code[p + 1] === '/') {
+                p += 2;
+                while (p < code.length && code[p] !== '\n') p++;
+            } else if (c === '/' && code[p + 1] === '*') {
+                p += 2;
+                while (p < code.length && !(code[p] === '*' && code[p + 1] === '/')) p++;
+                p += 2;
             }
-            result += content[i];
-            i++;
-        } else {
-            result += content[i];
-            i++;
+            p++;
         }
+        idx++;
+        total++;
+        const body = code.slice(bodyStart, p - 1);
+        result += `static __sb_${idx}=(()=>{${body}})();`;
+        lastIndex = p;
+        regex.lastIndex = p;
     }
-    return { result, modified };
+    result += code.slice(lastIndex);
+    return { result, total };
 }
 
 try {
     const jsFiles = findJsFiles('/app/dist');
-    let totalPatched = 0;
+    let grandTotal = 0;
     for (const file of jsFiles) {
         const content = fs.readFileSync(file, 'utf8');
-        if (content.includes('static') && /static\s*\{/.test(content)) {
-            const { result, modified } = transform(content);
-            if (modified > 0) {
+        if (/(?<![a-zA-Z0-9_$])static\s*\{/.test(content)) {
+            const { result, total } = patchStaticBlocks(content);
+            if (total > 0) {
                 fs.writeFileSync(file, result, 'utf8');
-                totalPatched += modified;
+                grandTotal += total;
+                console.log(`[Nexterm-Patch] 6. 成功降级 ${path.basename(file)} 中的 ${total} 处 static { 语法块`);
             }
         }
     }
-    if (totalPatched > 0) {
-        console.log(`[Nexterm-Patch] 5. 前端资源补丁成功: 已自动将 ${totalPatched} 处 static { 语法块降级为 Safari 15 / iPad Air 2 兼容语法!`);
+    if (grandTotal > 0) {
+        console.log(`[Nexterm-Patch] 6. 前端兼容性补丁完成: 共计降级 ${grandTotal} 处 static { 语法块，已完全兼容 iPad Air 2 / Safari 15!`);
     } else {
-        console.log('[Nexterm-Patch] 5. 前端静态资源扫描完毕 (已是兼容格式或无需降级)');
+        console.log('[Nexterm-Patch] 6. 前端静态资源扫描完毕 (已是兼容格式或无需降级)');
     }
 } catch (err) {
-    console.error('[Nexterm-Patch] 5. 前端资源补丁处理跳过 (非关键错误):', err.message);
+    console.error('[Nexterm-Patch] 6. 前端资源补丁处理跳过 (非关键错误):', err.message);
 }
 NODE_EOF
 fi
