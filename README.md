@@ -6,17 +6,20 @@
 
 ## 核心解决的问题
 
-1. **解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (v1.4.0 新增)**：
+1. **彻底解决 SFTP 上传与下载报错 500 (SFTP error) (v1.5.0 新增)**：
+   - 官方为上传/下载设计了独立的辅助传输连接（`getSFTPTransferClient`），但在生成缩略图或完成初次传输后即陷入空闲；由于底层 C 引擎不轮询套接字，远端 SSH 超时切断后 Node.js 无法感知，并在后续上传/下载时复用已死的死连接，触发 `500 (Internal Server Error) Error: SFTP error` 且死连接永久缓存；
+   - 补丁自动将辅助传输客户端复用为已通过应用层心跳强保活的主 SFTP 连接，并在传输时保护状态避免心跳包干扰，支持大文件稳定传输与全链路 `[SFTP-TRANSFER]` 审计日志。
+2. **解决老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 白屏与语法报错 (v1.4.0)**：
    - 官方前端代码在 Vite 打包时保留了 ES2022 的类静态初始化块（`static { ... }`），而 Safari 15.6（iPadOS 15.8.8 最高支持版本）不支持该语法，导致动态加载代码块时抛出 `SyntaxError: Unexpected token '{' (promiseReactionJob)` 并陷入白屏；
    - 补丁脚本在 Docker 启动时使用 Node.js 自动将前端静态文件中的 `static { ... }` 降级替换为 Safari 14.1+ 原生支持的静态字段自执行函数（`static __init=(()=>{ ... })()`），**用户无需任何前端编译环境**即可使老旧 iPad 丝滑访问 Nexterm。
-2. **彻底解决 SFTP 运行一段时间自动断开 (v1.3.0)**：
+3. **彻底解决 SFTP 运行一段时间自动断开 (v1.3.0)**：
    - 官方底层 C 引擎（`engine/src/net/sftp.c`）在空闲时仅轮询内部通道，从不读取底层的 SSH 网络套接字，导致远程服务器发来的心跳包（`ClientAliveInterval`）无法被响应，达到次数后被服务端强制踢出；
    - 补丁在 Node.js 端注入每 25 秒的静默应用层心跳（`realpath(".")`），强制唤醒 C 引擎读写网络流并重置两端空闲计时器，同时增加 WebSocket Ping 心跳穿透 Nginx/Cloudflare。
-3. **突破 6 小时强制断开硬编码**：官方代码在 `SessionManager.js` 中每 30 分钟轮询一次，强杀创建满 6 小时的所有会话。
-4. **修复 SSH 活跃时间未刷新缺陷**：官方在 `hooks/ssh.js` 中遗漏了 `updateActivity` 调用，导致无论用户是否在使用，连接到达 6 小时必然被杀死。
-5. **彻底解决多窗口/跨设备同步崩溃 (Critical Bug)**：修复因原生 `hooks/ssh.js` 缺失 `logger` 引用导致关闭单个标签页触发 `ReferenceError`、进而致使整个容器主进程闪退重启并丢失全部连接的严重缺陷。
-6. **注入全协议精准断连诊断日志**：支持 SSH 与 SFTP 的对端 EOF、网络 Socket 重置追踪，统一带有 `[DISCONNECT-LOG]` 标识。
-7. **官方镜像无缝跟随升级**：采用 Docker Entrypoint Wrapper（启动包装）机制，每次拉取官方最新镜像启动时自动完成热补丁，完全不影响官方代码更新。
+4. **突破 6 小时强制断开硬编码**：官方代码在 `SessionManager.js` 中每 30 分钟轮询一次，强杀创建满 6 小时的所有会话。
+5. **修复 SSH 活跃时间未刷新缺陷**：官方在 `hooks/ssh.js` 中遗漏了 `updateActivity` 调用，导致无论用户是否在使用，连接到达 6 小时必然被杀死。
+6. **彻底解决多窗口/跨设备同步崩溃 (Critical Bug)**：修复因原生 `hooks/ssh.js` 缺失 `logger` 引用导致关闭单个标签页触发 `ReferenceError`、进而致使整个容器主进程闪退重启并丢失全部连接的严重缺陷。
+7. **注入全协议精准断连与传输诊断日志**：支持 SSH 与 SFTP 的对端 EOF、网络 Socket 重置追踪，统一带有 `[DISCONNECT-LOG]` 与 `[SFTP-TRANSFER]` 标识。
+8. **官方镜像无缝跟随升级**：采用 Docker Entrypoint Wrapper（启动包装）机制，每次拉取官方最新镜像启动时自动完成热补丁，完全不影响官方代码更新。
 
 ---
 
@@ -102,13 +105,20 @@ docker exec -it nexterm grep -n "sftpWsPing" /app/server/routes/sftpWS.js
 
 # 检查前端静态资源 Safari 15 兼容性补丁是否生效
 docker exec -it nexterm grep -n "__init" /app/dist/assets/*.js
+
+# 检查 SFTP 上传与下载复用补丁是否生效
+docker exec -it nexterm grep -n "getSFTPTransferClient = async" /app/server/lib/ConnectionService.js
 ```
 
 ---
 
 ## 版本演进记录 (Changelog)
 
-- **v1.4.0 (Latest)**：
+- **v1.5.0 (Latest)**：
+  - **彻底修复 SFTP 上传与下载报错 500 (SFTP error)**：
+    - 根因：官方上传/下载使用独立创建的辅助传输连接（`getSFTPTransferClient`），该连接没有保活心跳，闲置后被远程 SSH 服务端踢断；但 Node.js 端因 C 引擎未轮询底层网络套接字而感知不到，下次上传/下载复用已死连接必然抛出 500 `SFTP error` 且死连接永久缓存；
+    - 修复：自动将辅助传输客户端复用为主 SFTP 连接，在传输中保护状态并自动刷新活跃时间，注入全链路 `[SFTP-TRANSFER]` 日志。
+- **v1.4.0**：
   - **新增老旧设备 (iPad Air 2 / Safari 15 / iOS 15) 前端语法降级兼容补丁**：
     - 针对 iPadOS 15.8.8 (Safari 15.6) 报错 `SyntaxError: Unexpected token '{' (promiseReactionJob)` 白屏问题；
     - 启动时自动扫描 `/app/dist` 静态资源，将 ES2022 `static { ... }` 动态转译为 Safari 14.1+ 即原生支持的静态字段自执行函数（`static __init=(()=>{ ... })()`）；

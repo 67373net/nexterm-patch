@@ -225,3 +225,42 @@
 - 采用健壮的状态机扫描，跳过字符串、模板字符串、注释与正则字面量，精准匹配并降级 `static { ... }`；
 - 具备严格的幂等性（Idempotence），多次重启不会重复修改；
 - 用户仅需更新宿主机上的 `patch-and-start.sh` 并执行 `docker compose restart`，即可让老旧 iPad Air 2 彻底告别白屏，完美使用 Nexterm。
+
+---
+
+## 九、 SFTP 长期保持连接后上传/下载抛出 500 (SFTP error) 的深度排查与修复 (v1.5.0)
+
+### 9.1 用户反馈与故障日志
+- **故障现象**：在应用了 v1.3.0 / v1.4.0 保活补丁后，SFTP 目录可以一直保持连接并流畅浏览数小时不掉线，但是**进行文件上传或下载时均报错失败**。
+- **浏览器控制台关键报错**：
+  ```text
+  POST http://.../api/entries/sftp/upload?sessionId=940b1ffa-...&path=%2Fhome%2Fnet67373%2Fsquirrel.yaml 500 (Internal Server Error)
+  Servers-B_2DYFhw.js:2 Upload error: Error: SFTP error
+      at s.onload (ToastContext-DKhmpqnM.js:2:2836514)
+  ```
+  在下载文件时亦提示加载资源异常。
+
+### 9.2 根因深度剖析
+1. **架构双连接设计机制（Master vs Transfer）**：
+   - Nexterm 官方为了避免大文件传输占用目录浏览通道，在设计上将 SFTP 连接分为了主连接（`conn.sftpClient`，用于目录浏览、新建文件夹等元数据操作）和辅助传输连接（`conn.transferClient`，通过 `getSFTPTransferClient` 独立连接，用于上传和下载）；
+   - 在 `routes/sftp.js`（上传/下载路由）的 `validateSession` 中，官方尝试优先获取 `transferClient`。
+2. **致命缺陷：辅助连接缺乏保活机制与死连接缓存**：
+   - 在用户打开包含图片的目录时，前端会请求缩略图（`thumbnail=true`），或者在用户初次打开传输路由时，系统便为该会话创建了一个独立的 `engineSessionId`（如 `${sessionId}-xfer-1`）；
+   - 随后的长时间浏览中，我们的 v1.3.0 补丁持续对主连接 `conn.sftpClient` 发送应用层保活心跳（`realpath(".")`），因此主连接完好无损、浏览永远不掉线；
+   - **但是，`conn.transferClient` 完全没有任何保活心跳！** 闲置 1~2 分钟后，远端 SSH 服务器因检测到没有心跳探测响应，单方面斩断了辅助传输连接；
+   - **C 引擎通信黑洞**：C 引擎 `sftp.c` 在空闲时阻塞在内部 IPC 通道 `data_fd` 的 `poll` 上，根本不去轮询 `ssh_sock` 套接字，因此无法获知远端已经断连；
+   - **Node.js 无法察觉**：本地 UNIX Socket / TCP 通道未断开，`conn.transferClient._closed` 仍为 `false`；
+   - **致命的死连接复用**：当用户点击上传（如 `squirrel.yaml`）或下载时，`getSFTPTransferClient` 直接将这个已经死掉的 `conn.transferClient` 返回；
+   - C 引擎尝试调用 `libssh2_sftp_open` 打开目标文件，发现底层 SSH 会话已断，返回 `NULL` 并上报 `SFTP error`（错误码 500）；
+   - **更严重的是**：出错后 Node.js 与 C 引擎均未销毁该连接，导致死连接被永久缓存在内存中，后续任何上传与下载永久报 500 `SFTP error`！
+
+### 9.3 终极修复方案 (v1.5.0)
+1. **复用强保活主连接，杜绝僵尸死连接**：
+   - 在 `ConnectionService.js` 中将 `getSFTPTransferClient` 和 `getSFTPBackgroundClient` 改造为直接复用当前会话已存在的、受 25 秒主动心跳强力保活的主连接 `conn.sftpClient`（若不存在则自动初始化）；
+   - 彻底避免在远端服务器上建立不稳定的次级连接，解决部分云主机限制并发连接数（`MaxSessions 1`）以及次级连接空闲超时的难题。
+2. **传输状态保护与活跃度联动**：
+   - 在 `routes/sftp.js` 中为上传和下载注入状态标识 `_activeTransfer`；
+   - 心跳定时器在检测到当前连接正在进行活动传输时，自动跳过 `realpath` 心跳包发送，避免大文件上传下载时数据流交织冲突；
+   - 在文件传输开始和结束时自动触发 `SessionManager.updateActivity(sessionId)`，保证会话活性。
+3. **注入全链路传输审计日志**：
+   - 注入带有 `[SFTP-TRANSFER]` 标识的控制台日志，实时输出上传与下载的文件路径与结果，极大便于排查。
